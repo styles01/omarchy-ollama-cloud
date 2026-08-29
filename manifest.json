@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.styles01.ollama-cloud",
+  "name": "Ollama Cloud Usage",
+  "version": "1.0.0",
+  "author": "styles01",
+  "license": "MIT",
+  "description": "Adds Ollama Cloud to Omarchy's existing AI toolbar widget (the stock AI icon), not a new bar icon.",
+  "kinds": ["service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
