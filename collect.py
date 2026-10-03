@@ -40,7 +40,10 @@ BROWSERS = [
     (["brave-browser", "brave"], "brave"),
 ]
 
-UNIT_RE = {"minute": 60, "minutes": 60, "hour": 3600, "hours": 3600, "day": 86400, "days": 86400}
+UNIT_RE = {
+  "minute": 60, "minutes": 60, "hour": 3600, "hours": 3600, "day": 86400, "days": 86400,
+  "week": 604800, "weeks": 604800,
+}
 
 STATS_KEYS = (
     "todayPrompts",
@@ -201,9 +204,9 @@ def text_nodes(dom: str) -> list[str]:
 
 
 def parse_resets_at(text: str, now: datetime) -> str:
-  """'Resets in 1 day, 2 hours' / 'Resets in 4 hours' -> ISO timestamp."""
+  """'Resets in 1 day, 2 hours' / 'Resets in 3 weeks.' -> ISO timestamp."""
   seconds = 0.0
-  for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s+(hours?|minutes?|days?)", text, re.I):
+  for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s+(hours?|minutes?|days?|weeks?)", text, re.I):
     seconds += float(num) * UNIT_RE[unit.lower()]
   if not seconds:
     return ""
@@ -232,21 +235,47 @@ def parse_models(dom: str, start_marker: str) -> list[dict]:
 def parse_balance(text_lines: list[str]) -> dict:
   balance = {"remaining": 0, "funded": 0, "spent": 0, "currency": "USD", "estimated": False}
   for i, line in enumerate(text_lines):
-    if line.strip().lower() == "balance remaining" and i + 1 < len(text_lines):
+    label = line.strip().lower()
+    # Older layout: "Balance remaining" then the amount.
+    if label == "balance remaining" and i + 1 < len(text_lines):
       m = re.search(r"\$([\d.,]+)", text_lines[i + 1])
+      if m:
+        balance["remaining"] = float(m.group(1).replace(",", ""))
+      break
+    # Monthly layout: the usage-credits amount, then "Current balance".
+    if label == "current balance" and i > 0:
+      m = re.fullmatch(r"\$([\d.,]+)", text_lines[i - 1].strip())
       if m:
         balance["remaining"] = float(m.group(1).replace(",", ""))
       break
   return balance
 
 
+def parse_monthly_models(text_lines: list[str]) -> dict[str, int]:
+  """'Models used this month' followed by model / 'N requests' line pairs."""
+  if "Models used this month" not in text_lines:
+    return {}
+  out: dict[str, int] = {}
+  i = text_lines.index("Models used this month") + 1
+  while i + 1 < len(text_lines):
+    m = re.fullmatch(r"([\d,]+)\s+requests?", text_lines[i + 1].strip(), re.I)
+    if not m:
+      break
+    out[text_lines[i].strip()] = int(m.group(1).replace(",", ""))
+    i += 2
+  return out
+
+
 def build_record(lines: list[str], dom: str) -> dict:
   # plan tier: the line right after "Cloud usage"
   tier = ""
-  if "Cloud usage" in lines:
-    i = lines.index("Cloud usage")
-    if i + 1 < len(lines) and re.fullmatch(r"[a-z0-9 .-]{1,20}", lines[i + 1]):
-      tier = lines[i + 1].strip()
+  # "Cloud usage" on the session/weekly layout, "Included usage" on the monthly one.
+  for heading in ("Cloud usage", "Included usage"):
+    if heading in lines:
+      i = lines.index(heading)
+      if i + 1 < len(lines) and re.fullmatch(r"[a-z0-9 .-]{1,20}", lines[i + 1]):
+        tier = lines[i + 1].strip()
+        break
 
   now = datetime.now().astimezone()
   limits = []
@@ -270,12 +299,31 @@ def build_record(lines: list[str], dom: str) -> dict:
       "title": "Weekly",
     })
 
+  # Monthly layout: "Monthly usage" / "$18.51 of $60 used" / "Resets in 3 weeks."
+  if "Monthly usage" in lines:
+    i = lines.index("Monthly usage")
+    window = " ".join(lines[i:i + 4])
+    m = re.search(r"\$([\d.,]+)\s+of\s+\$([\d.,]+)\s+used", window, re.I)
+    if m:
+      spent = float(m.group(1).replace(",", ""))
+      allowance = float(m.group(2).replace(",", ""))
+      limits.append({
+        "label": "Monthly",
+        "percent": spent / allowance if allowance else 0.0,
+        "resetsAt": parse_resets_at(window, now),
+        "title": "Monthly",
+      })
+
+  model_requests = {m["model"]: m["requests"] for m in parse_models(dom, "Weekly usage")}
+  if not model_requests:
+    model_requests = parse_monthly_models(lines)
+
   return empty_result(
     ready=True,
     tierLabel=tier,
     limits=[l for l in limits if l["resetsAt"]],
     balance=parse_balance(lines),
-    modelRequests={m["model"]: m["requests"] for m in parse_models(dom, "Weekly usage")},
+    modelRequests=model_requests,
   )
 
 
