@@ -2,7 +2,7 @@
 
 Adds **Ollama Cloud** to Omarchy's **existing AI toolbar widget** — the AI icon already on the top bar. It does not add a second icon.
 
-After install, click that same AI button. You get an **Ollama Cloud** provider next to Claude Code / Codex: your plan tier, the 5-hour session and weekly limit meters, extra-usage balance, and per-model request counts as recorded from ollama.com.
+After install, click that same AI button. You get an **Ollama Cloud** provider next to Claude Code / Codex: your plan tier, the 5-hour session and weekly limit meters, extra-usage balance, and per-model request counts as recorded by the ollama-meter companion.
 
 Preview:
 
@@ -18,8 +18,9 @@ Requires:
 
 - Omarchy with the stock AI widget enabled (`omarchy.agents`, on by default)
 - Python 3 on `PATH` (stdlib only)
-- A Chromium-based browser (Google Chrome, Chromium, or Brave) **signed in to [ollama.com](https://ollama.com)** — open ollama.com once and make sure you are logged in
-- A unlocked desktop keyring session (the browser needs it to decrypt its own cookies)
+- An **ollama-meter** companion reachable on the network (HTTP on port `8615`, UDP beacon on port `8616`)
+
+No browser, no ollama.com sign-in and no keyring are needed — the collector only speaks plain HTTP to the meter. ollama.com is never polled here; the meter on the mini is the only poller (ollama.com rate-limits to 10 req/min shared).
 
 Leave the built-in AI icon where it is. After the first scan (up to 15 minutes after login, or immediately after a panel refresh), click the AI icon and switch to **Ollama Cloud**.
 
@@ -32,14 +33,16 @@ Leave the built-in AI icon where it is. After the first scan (up to 15 minutes a
 
 This plugin is a headless service. It only writes an Ollama Cloud usage record for the stock panel to display.
 
-ollama.com has no usage API, so the collector renders `https://ollama.com/settings` with a **headless copy of your desktop browser profile** and reads the numbers straight off the page: tier name, "Session usage", "Weekly usage" (percent used and reset countdowns), the extra-usage balance, and per-model request segments. Manual override if auto-detection picks the wrong target:
+**Meter discovery**, in order:
 
-```sh
-# pick a specific browser binary
-ollama_usage=chromium  # or: OLLAMA_USAGE_BROWSER=chromium
-# pick a specific profile directory (e.g. ~/.config/google-chrome/Profile 2)
-OLLAMA_USAGE_PROFILE="~/.config/google-chrome/Profile 2"
-```
+1. explicit `--meter-url http://<host>:8615` or `OLLAMA_METER_URL=http://<host>:8615`
+2. the last URL that produced a good summary (cached in `~/.local/state/omarchy/agents/usage/ollama-meter-url`)
+3. the meter's UDP beacon on port `8616` (`OLLAMA-METER <ip> <port>`)
+4. the mDNS name `ollama-meter.local` on port `8615`
+
+The collector reads `GET /api/summary` and renders the session/weekly used percent and reset times. Since the meter switched to ollama.com's native `/api/balance` (`quota_source: "balance-api"`), percentages are balance-derived and the extra-usage balance comes from `cloud.purchased_balance_usd`; older summaries (`quota_source: "calibration"`, with `session_quota`/`weekly_quota`) render identically — those quota fields are simply not needed. Discovered meter URLs are cached locally (an IP, not a credential).
+
+If the meter is unreachable, the last good record is kept so the panel chip does not blank; with no prior record the panel shows "--" instead of crashing.
 
 ## Remove
 
@@ -51,7 +54,7 @@ Removal deletes the plugin checkout and drops `~/.local/state/omarchy/agents/usa
 
 ## Privacy
 
-The collector renders one local page view with your existing browser session. No cookies, tokens, or page content are written anywhere — only the usage numbers land in the state file. Expired sessions are not refreshed; open ollama.com in your browser and sign in again to renew.
+The collector fetches one local HTTP endpoint. No cookies, tokens, or page content are written anywhere — only the usage numbers land in the state file.
 
 ## License
 

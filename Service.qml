@@ -31,8 +31,8 @@ Item {
     clearProcess.running = true
   }
 
-  // Ollama usage changes slowly; 15 minutes is plenty and keeps the
-  // headless browser render cheap.
+  // Ollama usage changes slowly; 15 minutes is plenty, and the collector's
+  // HTTP fetch is cheap.
   Timer {
     interval: 900000
     running: true

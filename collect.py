@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-# omarchy:args=[--force] [--browser <name>] [--profile <dir>]
+# omarchy:args=[--force] [--meter-url <url>]
 """Print or write the Ollama Cloud usage record as JSON.
 
-The only source of Ollama Cloud usage is the signed-in settings page on
-ollama.com (server-rendered htmx HTML; no JSON API). This collector lets a
-headless Chromium-based browser render that page with the desktop browser's
-session cookies, parses the plan limits, balance, and per-model request
-counts, and emits one display-ready JSON record for the stock AI toolbar
-widget.
+The single source of Ollama Cloud usage is the ollama-meter companion
+service on the mini (port 8615), whose /api/summary endpoint exposes
+session/weekly used percent and reset times. ollama.com itself is never
+polled here — the meter is the only poller (ollama.com rate-limits
+10 req/min shared across the household).
 
-Auth relies on the browser's own cookie decryption, which needs the session
-keyring; nothing is logged or stored beyond the usage numbers themselves.
+Meter discovery, in order:
+  1. --meter-url / $OLLAMA_METER_URL (explicit wins)
+  2. the last URL that produced a good summary (cached in the state dir)
+  3. the meter's UDP beacon on port 8616 ("OLLAMA-METER <ip> <port>")
+  4. mDNS name ollama-meter.local (:8615)
+
+If the meter cannot be reached, the last good record is kept (a transient
+outage must not blank the panel chip); with no prior record the collector
+emits an empty record so the panel shows "--" instead of crashing.
 """
 
 from __future__ import annotations
@@ -18,29 +24,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import shutil
-import sqlite3
-import subprocess
+import socket
 import sys
-import tempfile
-import unicodedata
-import uuid
-from datetime import datetime, timedelta, timezone
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 AGENT_ID = "ollama"
 AGENT_NAME = "Ollama Cloud"
-SETTINGS_URL = "https://ollama.com/settings"
-
-# (binary candidates in preference order, per-browser config dir name)
-BROWSERS = [
-    (["google-chrome-stable", "google-chrome", "chrome"], "google-chrome"),
-    (["chromium", "chromium-browser"], "chromium"),
-    (["brave-browser", "brave"], "brave"),
-]
-
-UNIT_RE = {"minute": 60, "minutes": 60, "hour": 3600, "hours": 3600, "day": 86400, "days": 86400}
+METER_HTTP_PORT = 8615
+MDNS_NAME = "ollama-meter.local"
+BEACON_PORT = 8616
+HTTP_TIMEOUT = 5.0
+MDNS_TIMEOUT = 4.0
 
 STATS_KEYS = (
     "todayPrompts",
@@ -63,6 +59,10 @@ def state_dir() -> Path:
 
 def usage_record_path() -> Path:
   return state_dir() / f"{AGENT_ID}.json"
+
+
+def meter_cache_path() -> Path:
+  return state_dir() / "ollama-meter-url"
 
 
 def empty_result(**overrides) -> dict:
@@ -93,229 +93,162 @@ def empty_result(**overrides) -> dict:
   return out
 
 
-def expand_path(value: str | None) -> Path | None:
-  text = str(value or "").strip()
-  if not text:
-    return None
-  return Path(os.path.expandvars(os.path.expanduser(text))).expanduser()
+# ---------------------------------------------------------------- meter fetch
+
+def fetch_json(url: str, timeout: float = HTTP_TIMEOUT) -> dict:
+  with urllib.request.urlopen(url, timeout=timeout) as resp:
+    return json.loads(resp.read().decode("utf-8"))
 
 
-def resolve_browser(name: str | None) -> tuple[str, Path] | None:
-  """Find a (binary, config-dir) pair. Explicit --browser / env wins."""
-  if name:
-    norm = name.lower()
-    for bins, dirname in BROWSERS:
-      if norm in (b.lower() for b in bins) or norm == dirname.lower().replace("-", ""):
-        for b in bins:
-          path = shutil.which(b)
-          if path:
-            return path, Path.home() / ".config" / dirname
-        break
-    path = shutil.which(name)
-    if path:
-      return path, Path.home() / ".config" / name
+def summary_from_url(url: str) -> dict:
+  """GET {url}/api/summary and return it if the payload is a real meter."""
+  base = url.rstrip("/")
+  data = fetch_json(f"{base}/api/summary")
+  if not isinstance(data, dict) or not isinstance(data.get("cloud"), dict):
+    raise TypeError(f"{base}: not an ollama-meter summary (no 'cloud' object)")
+  return data["cloud"]
+
+
+def beacon_discovery() -> str | None:
+  """Listen briefly for 'OLLAMA-METER <ip> <port>' on UDP :8616."""
+  sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  if hasattr(socket, "SO_REUSEPORT"):
+    try:
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except OSError:
+      pass
+  sock.settimeout(MDNS_TIMEOUT)
+  try:
+    sock.bind(("", BEACON_PORT))
+  except OSError:
     return None
-  for bins, dirname in BROWSERS:
-    for b in bins:
-      path = shutil.which(b)
-      if path:
-        return path, Path.home() / ".config" / dirname
+  try:
+    parts = sock.recvfrom(256)[0].decode("utf-8", "replace").split()
+    if len(parts) >= 3 and parts[0] == "OLLAMA-METER":
+      ip, port = parts[1], parts[2]
+      if port.isdigit():
+        return f"http://{ip}:{port}"
+  except OSError:
+    pass
+  finally:
+    sock.close()
   return None
 
 
-def profile_candidates(config_dir: Path) -> list[Path]:
-  if not config_dir.is_dir():
-    return []
-  out = []
-  default = config_dir / "Default"
-  if (default / "Cookies").exists():
-    out.append(default)
-  for p in sorted(config_dir.glob("Profile */Cookies")) + sorted(config_dir.glob("profile*/Cookies")):
-    out.append(p.parent)
-  return out
-
-
-def has_ollama_session(profile_dir: Path) -> bool:
-  """True if the (still encrypted) cookie DB mentions ollama.com."""
-  db = profile_dir / "Cookies"
-  if not db.exists():
-    return False
+def mdns_discovery() -> str | None:
   try:
-    with sqlite3.connect(f"file:{db}?immutable=1", uri=True) as conn:
-      row = conn.execute(
-        "SELECT COUNT(*) FROM cookies WHERE host_key LIKE '%ollama.com'"
-      ).fetchone()
-      return bool(row and row[0])
-  except Exception:
-    return False
+    infos = socket.getaddrinfo(MDNS_NAME, METER_HTTP_PORT, type=socket.SOCK_STREAM)
+  except OSError:
+    return None
+  if infos:
+    host = infos[0][4][0]
+    return f"http://{host}:{METER_HTTP_PORT}"
+  return None
 
 
-def pick_profiles(config_dir: Path) -> list[Path]:
-  """Profiles with an ollama.com session, newest first."""
-  candidates = [p for p in profile_candidates(config_dir) if has_ollama_session(p)]
-  return sorted(candidates, key=lambda p: (p / "Cookies").stat().st_mtime, reverse=True)
+def resolve_meter(explicit: str | None) -> tuple[str, dict]:
+  """Return (base_url, cloud_summary); persist a good URL for next time."""
+  candidates: list[str] = []
+  if explicit:
+    candidates.append(explicit.rstrip("/"))
+  cached = ""
+  try:
+    cached = meter_cache_path().read_text().strip()
+  except OSError:
+    pass
+  if cached.startswith("http"):
+    candidates.append(cached.rstrip("/"))
+  for url in beacon_discovery(), mdns_discovery():
+    if url:
+      candidates.append(url)
 
-
-def render_page(binary: str, config_dir: Path, profile_dir: Path, url: str) -> str:
-  """Render a page with headless Chromium using a copy of a real profile."""
-  with tempfile.TemporaryDirectory(prefix="ollama-usage-") as tmp:
-    profile = Path(tmp) / "profile" / "Default"
-    profile.mkdir(parents=True)
-    for name in ("Cookies", "Preferences"):
-      src = profile_dir / name
-      if src.exists():
-        shutil.copy2(src, profile / name)
-    local_state = config_dir / "Local State"
-    if local_state.exists():
-      shutil.copy2(local_state, Path(tmp) / "profile" / "Local State")
-    flags = [
-      binary, "--headless=new", "--no-sandbox", "--disable-gpu",
-      "--no-first-run", "--disable-sync", "--disable-extensions",
-      f"--user-data-dir={tmp}/profile",
-      "--virtual-time-budget=15000", "--dump-dom", url,
-    ]
+  errors = []
+  tried = set()
+  for url in candidates:
+    if url in tried:
+      continue
+    tried.add(url)
     try:
-      proc = subprocess.run(flags, capture_output=True, text=True, timeout=90)
-    except subprocess.TimeoutExpired:
-      raise RuntimeError("headless browser timed out")
-    dom = proc.stdout
-    if proc.returncode != 0 or len(dom) < 2000:
-      raise RuntimeError(f"headless browser failed (rc={proc.returncode}, bytes={len(dom)})")
-  return dom
+      cloud = summary_from_url(url)
+      try:
+        meter_cache_path().write_text(url + "\n")
+      except OSError:
+        pass
+      return url, cloud
+    except Exception as exc:
+      errors.append(f"{url}: {exc}")
+  raise RuntimeError("; ".join(errors) or "no meter candidates available")
 
 
-def is_signed_out(dom: str) -> bool:
-  return "signin.ollama.com" in dom or "Sign in" in dom[:20000]
+# ---------------------------------------------------------------- record build
 
-
-def text_nodes(dom: str) -> list[str]:
-  """Visible text blocks in document order."""
-  dom = re.sub(r"<(script|style)\b.*?</\1>", " ", dom, flags=re.S)
-  dom = re.sub(r"<[^>]+>", "\n", dom)
-  out = []
-  for raw in dom.split("\n"):
-    line = unicodedata.normalize("NFKD", raw).strip()
-    if line:
-      out.append(line)
-  return out
-
-
-def parse_resets_at(text: str, now: datetime) -> str:
-  """'Resets in 1 day, 2 hours' / 'Resets in 4 hours' -> ISO timestamp."""
-  seconds = 0.0
-  for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s+(hours?|minutes?|days?)", text, re.I):
-    seconds += float(num) * UNIT_RE[unit.lower()]
-  if not seconds:
+def local_iso(utc_text: str) -> str:
+  """'2026-11-02T00:00:00Z' -> local-time ISO with seconds (panel format)."""
+  text = (utc_text or "").strip()
+  if not text:
     return ""
-  return (now + timedelta(seconds=seconds)).astimezone().isoformat(timespec="seconds")
+  try:
+    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+  except ValueError:
+    return ""
+  if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=timezone.utc)
+  return dt.astimezone().isoformat(timespec="seconds")
 
 
-def parse_percent_runs(text: str) -> float:
-  m = re.search(r"([\d.]+)\s*%\s*used", text, re.I)
-  return float(m.group(1)) if m else 0.0
+def build_record(cloud: dict) -> dict:
+  tier = str(cloud.get("plan") or "").strip()
+  tier = tier[:1].upper() + tier[1:] if tier else ""
 
-
-def parse_models(dom: str, start_marker: str) -> list[dict]:
-  """Usage segments whose nearest preceding section marker is start_marker."""
-  marks = [m.start() for m in re.finditer(r"Session usage|Weekly usage", dom)]
-  models: list[dict] = []
-  for seg in re.finditer(r'data-model="([^"]+)" data-requests="(\d+)"', dom):
-    section = None
-    for pos in marks:
-      if pos < seg.start():
-        section = dom[pos:pos + 20]
-    if section and section.startswith(start_marker):
-      models.append({"model": seg.group(1), "requests": int(seg.group(2))})
-  return models
-
-
-def parse_balance(text_lines: list[str]) -> dict:
-  balance = {"remaining": 0, "funded": 0, "spent": 0, "currency": "USD", "estimated": False}
-  for i, line in enumerate(text_lines):
-    if line.strip().lower() == "balance remaining" and i + 1 < len(text_lines):
-      m = re.search(r"\$([\d.,]+)", text_lines[i + 1])
-      if m:
-        balance["remaining"] = float(m.group(1).replace(",", ""))
-      break
-  return balance
-
-
-def build_record(lines: list[str], dom: str) -> dict:
-  # plan tier: the line right after "Cloud usage"
-  tier = ""
-  if "Cloud usage" in lines:
-    i = lines.index("Cloud usage")
-    if i + 1 < len(lines) and re.fullmatch(r"[a-z0-9 .-]{1,20}", lines[i + 1]):
-      tier = lines[i + 1].strip()
-
-  now = datetime.now().astimezone()
   limits = []
-  if "Session usage" in lines:
-    i = lines.index("Session usage")
-    window = " ".join(lines[i:i + 6])
+  if cloud.get("session_pct") is not None and str(cloud.get("session_reset_at") or "").strip():
     limits.append({
       "label": "Session (5-hour)",
       # Panel expects percent as a 0-1 fraction
-      "percent": parse_percent_runs(window) / 100.0,
-      "resetsAt": parse_resets_at(window, now),
+      "percent": round(float(cloud["session_pct"]) / 100.0, 4),
+      "resetsAt": local_iso(str(cloud.get("session_reset_at") or "")),
       "title": "Session",
     })
-  if "Weekly usage" in lines:
-    i = lines.index("Weekly usage")
-    window = " ".join(lines[i:i + 6])
+  if cloud.get("weekly_pct") is not None and str(cloud.get("weekly_reset_at") or "").strip():
     limits.append({
       "label": "Weekly",
-      "percent": parse_percent_runs(window) / 100.0,
-      "resetsAt": parse_resets_at(window, now),
+      "percent": round(float(cloud["weekly_pct"]) / 100.0, 4),
+      "resetsAt": local_iso(str(cloud.get("weekly_reset_at") or "")),
       "title": "Weekly",
     })
 
+  balance: dict = {"remaining": 0, "funded": 0, "spent": 0, "currency": "USD", "estimated": False}
+  if cloud.get("purchased_balance_usd") is not None:
+    balance["remaining"] = float(cloud["purchased_balance_usd"])
+
+  model_requests: dict = {}
+  top_models = cloud.get("top_models")
+  if isinstance(top_models, list):
+    for entry in top_models:
+      if isinstance(entry, dict):
+        model = str(entry.get("model") or "")
+        requests = entry.get("requests")
+        if model and isinstance(requests, int):
+          model_requests[model] = requests
+
   return empty_result(
-    ready=True,
+    ready=bool(cloud.get("available", True)),
     tierLabel=tier,
-    limits=[l for l in limits if l["resetsAt"]],
-    balance=parse_balance(lines),
-    modelRequests={m["model"]: m["requests"] for m in parse_models(dom, "Weekly usage")},
+    limits=limits,
+    balance=balance,
+    modelRequests=model_requests,
   )
 
 
-def collect_record(browser_name: str | None, profile_override: Path | None) -> dict:
-  """Render ollama.com/settings and parse it into a usage record."""
-  found = resolve_browser(browser_name)
-  if not found:
-    raise RuntimeError("no Chromium-based browser found (google-chrome, chromium, or brave)")
-  binary, config_dir = found
-
-  if profile_override:
-    if not profile_override.is_dir():
-      raise RuntimeError(f"profile directory not found: {profile_override}")
-    dom = render_page(
-      binary, config_dir, profile_override, f"{SETTINGS_URL}?nonce={uuid.uuid4().hex[:8]}"
-    )
-    if is_signed_out(dom):
-      raise RuntimeError(f"{profile_override.name}: signed out of ollama.com")
-    return build_record(text_nodes(dom), dom)
-
-  profiles = pick_profiles(config_dir)
-  if not profiles:
-    raise RuntimeError(
-      f"no {Path(binary).name} profile has ollama.com cookies;"
-      " sign in to ollama.com in the desktop browser first"
-    )
-  dom = ""
-  errors = []
-  for profile in profiles:
-    try:
-      dom = render_page(binary, config_dir, profile, f"{SETTINGS_URL}?nonce={uuid.uuid4().hex[:8]}")
-      if not is_signed_out(dom):
-        break
-      errors.append(f"{profile.name}: signed out")
-      dom = ""
-    except (RuntimeError, OSError) as exc:
-      errors.append(f"{profile.name}: {exc}")
-  if not dom:
-    raise RuntimeError("; ".join(errors) or "no usable browser profile")
-  return build_record(text_nodes(dom), dom)
+def collect_record(explicit_url: str | None) -> dict:
+  url, cloud = resolve_meter(explicit_url)
+  record = build_record(cloud)
+  if not record["ready"]:
+    raise RuntimeError(f"{url}: meter says cloud usage unavailable")
+  if not record["limits"]:
+    raise RuntimeError(f"{url}: summary has no usable session/weekly percentages")
+  return record
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -326,34 +259,28 @@ def main(argv: list[str] | None = None) -> int:
   parser.add_argument("--write", action="store_true", help="write ~/.local/state/omarchy/agents/usage/ollama.json")
   parser.add_argument("--clear", action="store_true", help="remove ollama.json so the agents panel drops the Ollama Cloud provider")
   parser.add_argument(
-    "--browser",
-    default=os.environ.get("OLLAMA_USAGE_BROWSER", ""),
-    help="Browser binary to render with (default: auto-detect google-chrome/chromium/brave)",
-  )
-  parser.add_argument(
-    "--profile",
-    default=os.environ.get("OLLAMA_USAGE_PROFILE", ""),
-    help="Browser profile directory holding the ollama.com session (default: auto-detect)",
+    "--meter-url",
+    default=os.environ.get("OLLAMA_METER_URL", ""),
+    help="Base URL of the ollama-meter (default: auto-discover via cache, UDP beacon on :8616, or ollama-meter.local)",
   )
   args = parser.parse_args(argv)
 
   if args.clear:
     usage_record_path().unlink(missing_ok=True)
+    meter_cache_path().unlink(missing_ok=True)
     return 0
 
   try:
-    record = collect_record(args.browser, expand_path(args.profile))
-    if not record["limits"] and not record["balance"].get("remaining"):
-      raise RuntimeError("usage page rendered but no limits found; ollama.com markup may have changed")
-  except (RuntimeError, OSError) as exc:
+    record = collect_record(args.meter_url or None)
+  except (RuntimeError, OSError, ValueError) as exc:
     print(f"ollama-cloud-usage: {exc}", file=sys.stderr)
     if usage_record_path().exists():
-      # Keep the last good record; a transient failure (locked keyring, network,
-      # markup change) should not blank the panel chip.
+      # Keep the last good record; a transient failure (meter down, network)
+      # should not blank the panel chip.
       return 0
     record = empty_result(
       usageStatusText="Ollama Cloud usage unavailable",
-      authHelpText="Sign in to ollama.com in your desktop browser, then refresh.",
+      authHelpText="Check that the ollama-meter service on the mini is running, then refresh.",
     )
 
   if args.write:
